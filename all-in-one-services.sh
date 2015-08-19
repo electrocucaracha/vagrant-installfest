@@ -35,7 +35,7 @@ gpgcheck=0
 EOF
 
 yum clean all
-yum install -y deltarpm
+yum install -y deltarpm crudini
 yum update -y
 rm -rf /etc/yum.repos.d/CentOS*.repo
 
@@ -43,8 +43,8 @@ rm -rf /etc/yum.repos.d/CentOS*.repo
 yum install -y rabbitmq-server
 
 # 2. Enable and start service
-chkconfig rabbitmq-server on
-/sbin/service rabbitmq-server start
+systemctl enable rabbitmq-server.service
+systemctl start rabbitmq-server.service
 
 # 3. Change default guest user password
 rabbitmqctl add_user openstack secure
@@ -58,59 +58,49 @@ yum install -y mariadb mariadb-server MySQL-python
 # 2. Configure remote access
 cat <<EOL > /etc/my.cnf
 [mysqld]
-bind-address = ${my_ip}
+bind-address = 0.0.0.0
 default-storage-engine = innodb
 innodb_file_per_table
 collation-server = utf8_general_ci
 init-connect = 'SET NAMES utf8'
 character-set-server = utf8
-datadir=/var/lib/mysql
-socket=/var/lib/mysql/mysql.sock
-symbolic-links=0
-
-[mysqld_safe]
-log-error=/var/log/mariadb/mariadb.log
-pid-file=/var/run/mariadb/mariadb.pid
-
-!includedir /etc/my.cnf.d
 EOL
 systemctl enable mariadb.service
 systemctl start mariadb.service
 
 echo -e "\nY\nsecure\nsecure\nY\n" | mysql_secure_installation
 
-# NoSQL Database
-
-# 1. Install nosql database server
-yum install -y mongodb-org
-
-# 2. Configure remote access
-sed -i "s/127.0.0.1/${my_ip}/g" /etc/mongod.conf
-echo "smallfiles = true" >> /etc/mongod.conf
-
-# 3. Start services
-service mongod start
-chkconfig mongod on
-
-sleep 5
-
-# 4. Create ceilometer database
-mongo --host all-in-one --eval '
-db = db.getSiblingDB("ceilometer");
-db.createUser({user: "ceilometer",
-pwd: "secure",
-roles: [ "readWrite", "dbAdmin" ]})'
-
 # Identity Service
+
+mysql -uroot -psecure -e "CREATE DATABASE keystone;"
+mysql -uroot -psecure -e "GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'all-in-one' IDENTIFIED BY 'secure';"
 
 # 1. Install OpenStack Identity Service and dependencies
 yum install -y openstack-keystone httpd mod_wsgi python-openstackclient memcached python-memcached
 
-pushd /root/shared/setup
-token=`openssl rand -hex 10`
-./keystone.sh ${token}
+# 2. Configure Database driver
+crudini --set /etc/keystone/keystone.conf database connection mysql://keystone:secure@all-in-one/keystone
+crudini --set /etc/keystone/keystone.conf revoke driver keystone.contrib.revoke.backends.sql.Revoke
 
-echo "ServerName ${HOSTNAME}">> /etc/httpd/conf/httpd.conf
+# 2.1 Configure Memcached
+crudini --set /etc/keystone/keystone.conf memcache servers localhost:11211
+crudini --set /etc/keystone/keystone.conf memcache provider keystone.token.providers.uuid.Provider
+crudini --set /etc/keystone/keystone.conf memcache driver keystone.token.persistence.backends.memcache.Token
+
+# 3. Generate tables
+su -s /bin/sh -c "keystone-manage db_sync" keystone
+
+mkdir -p /var/www/cgi-bin/keystone
+wget -O /var/www/cgi-bin/keystone/main http://$1/mrepo/scripts
+cp /var/www/cgi-bin/keystone/main /var/www/cgi-bin/keystone/admin
+
+chown -R keystone:keystone /var/www/cgi-bin/keystone
+chmod 755 /var/www/cgi-bin/keystone/*
+
+# 5. Configurate authorization token
+crudini --set /etc/keystone/keystone.conf DEFAULT admin_token ${token}
+
+echo "ServerName all-in-one">> /etc/httpd/conf/httpd.conf
 cat <<EOL > /etc/httpd/conf.d/wsgi-keystone.conf
 Listen 5000
 Listen 35357
@@ -144,285 +134,101 @@ EOL
 systemctl enable memcached.service httpd.service
 systemctl start memcached.service httpd.service
 
-./create_default_values.sh ${token}
-popd
+export OS_TOKEN=${token}
+export OS_URL=http://all-in-one:35357/v2.0
 
-#yum -y install policycoreutils-python
-#semanage port -a -t http_port_t -p tcp 5000
-#semanage port -a -t http_port_t -p tcp 35357
+openstack service create \
+  --name keystone --description "OpenStack Identity" identity
+
+openstack endpoint create \
+  --publicurl http://all-in-one:5000/v2.0 \
+  --internalurl http://all-in-one:5000/v2.0 \
+  --adminurl http://all-in-one:35357/v2.0 \
+  --region regionOne \
+  identity
+
+openstack project create --description "Admin Project" admin
+openstack user create --password "secure" admin
+openstack role create admin
+openstack role add --project admin --user admin admin
+openstack project create --description "Service Project" service
+openstack project create --description "Demo Project" demo
+
+openstack user create --password "secure" demo
+openstack role create user
+openstack role add --project demo --user demo user
+
+unset OS_TOKEN OS_URL
+export OS_VOLUME_API_VERSION=2
+export OS_PROJECT_DOMAIN_ID=default
+export OS_USER_DOMAIN_ID=default
+export OS_PROJECT_NAME=admin
+export OS_TENANT_NAME=admin
+export OS_USERNAME=admin
+export OS_PASSWORD=secure
+export OS_AUTH_URL=http://all-in-one:35357/v3
 
 # Image services
+
+mysql -uroot -psecure -e "CREATE DATABASE glance;"
+mysql -uroot -psecure -e "GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'all-in-one' IDENTIFIED BY 'secure';"
 
 # 1. Install OpenStack Identity Service and dependencies
 yum install -y openstack-glance python-glanceclient
 
-pushd /root/shared/setup
-./glance.sh
-popd
+# 1. User, service and endpoint creation
+source /root/admin-openrc.sh
+openstack user create glance --password=secure --email=glance@example.com
+openstack role add admin --user=glance --project=service
+openstack service create image --name=glance --description="OpenStack Image Service"
+openstack endpoint create \
+  --publicurl=http://all-in-one:9292 \
+  --internalurl=http://all-in-one:9292 \
+  --adminurl=http://all-in-one:9292 \
+  --region regionOne \
+  image
+
+# 2. Configure api service
+crudini --set /etc/glance/glance-api.conf database connection mysql://glance:secure@all-in-one/glance
+
+crudini --set /etc/glance/glance-api.conf keystone_authtoken auth_uri http://all-in-one:5000
+crudini --set /etc/glance/glance-api.conf keystone_authtoken auth_url http://all-in-one:35357
+crudini --set /etc/glance/glance-api.conf keystone_authtoken auth_plugin password
+crudini --set /etc/glance/glance-api.conf keystone_authtoken project_domain_id default
+crudini --set /etc/glance/glance-api.conf keystone_authtoken user_domain_id default
+crudini --set /etc/glance/glance-api.conf keystone_authtoken project_name service
+crudini --set /etc/glance/glance-api.conf keystone_authtoken username glance
+crudini --set /etc/glance/glance-api.conf keystone_authtoken password secure
+crudini --set /etc/glance/glance-api.conf paste_deploy flavor keystone
+
+crudini --set /etc/glance/glance-api.conf glance_store default_store file
+crudini --set /etc/glance/glance-api.conf glance_store filesystem_store_datadir /var/lib/glance/images/
+
+crudini --set /etc/glance/glance-api.conf DEFAULT notification_driver noop
+
+# 3. Configure registry service
+crudini --set /etc/glance/glance-registry.conf database connection  mysql://glance:secure@all-in-one/glance
+
+crudini --set /etc/glance/glance-registry.conf keystone_authtoken auth_uri http://all-in-one:5000
+crudini --set /etc/glance/glance-registry.conf keystone_authtoken auth_url http://all-in-one:35357
+crudini --set /etc/glance/glance-registry.conf keystone_authtoken auth_plugin password
+crudini --set /etc/glance/glance-registry.conf keystone_authtoken project_domain_id default
+crudini --set /etc/glance/glance-registry.conf keystone_authtoken user_domain_id default
+crudini --set /etc/glance/glance-registry.conf keystone_authtoken project_name service
+crudini --set /etc/glance/glance-registry.conf keystone_authtoken username glance
+crudini --set /etc/glance/glance-registry.conf keystone_authtoken password secure
+crudini --set /etc/glance/glance-registry.conf paste_deploy flavor keystone
+
+crudini --set /etc/glance/glance-registry.conf DEFAULT notification_driver noop
+
+# 4. Generate tables
+su -s /bin/sh -c "glance-manage db_sync" glance
 
 # 2. Enable and start services
 systemctl enable openstack-glance-api.service openstack-glance-registry.service
 systemctl start openstack-glance-api.service openstack-glance-registry.service
 
-source /root/.bashrc
 apt-get install -y python-glanceclient
 wget http://$1/mrepo/images/cirros-0.3.3-x86_64-disk.img
 glance image-create --name cirros --file cirros-0.3.3-x86_64-disk.img --disk-format qcow2  --container-format bare --is-public True
 
-# Compute controller services
-
-# 1. Install OpenStack Compute Service and dependencies
-yum install -y openstack-nova-api openstack-nova-cert openstack-nova-conductor openstack-nova-console openstack-nova-novncproxy openstack-nova-scheduler python-novaclient
-
-# 2. Configure Nova Service
-crudini --set /etc/nova/nova.conf DEFAULT my_ip ${my_ip}
-crudini --set /etc/nova/nova.conf DEFAULT novncproxy_host 0.0.0.0
-crudini --set /etc/nova/nova.conf DEFAULT novncproxy_port 6080
-crudini --set /etc/nova/nova.conf DEFAULT rpc_backend rabbit
-crudini --set /etc/nova/nova.conf DEFAULT rabbit_host all-in-one
-crudini --set /etc/nova/nova.conf DEFAULT rabbit_password secure
-crudini --set /etc/nova/nova.conf DEFAULT auth_strategy keystone
-
-# 3. Configure Database driver
-crudini --set /etc/nova/nova.conf database connection mysql://nova:secure@all-in-one/nova
-
-# 4. Configure Authentication
-crudini --set /etc/nova/nova.conf keystone_authtoken identity_uri http://all-in-one:35357
-crudini --set /etc/nova/nova.conf keystone_authtoken admin_tenant_name service
-crudini --set /etc/nova/nova.conf keystone_authtoken admin_user nova
-crudini --set /etc/nova/nova.conf keystone_authtoken admin_password secure
-
-crudini --set /etc/nova/nova.conf paste_deploy flavor keystone
-
-crudini --set /etc/nova/nova.conf glance host image
-
-# 5. Generate tables
-su -s /bin/sh -c "nova-manage db sync" nova
-
-# 6. Enable and start services
-systemctl enable openstack-nova-api.service openstack-nova-cert.service openstack-nova-consoleauth.service openstack-nova-scheduler.service openstack-nova-conductor.service openstack-nova-novncproxy.service
-systemctl start openstack-nova-api.service openstack-nova-cert.service openstack-nova-consoleauth.service openstack-nova-scheduler.service openstack-nova-conductor.service openstack-nova-novncproxy.service
-
-# Controller - Networking services
-
-crudini --set /etc/nova/nova.conf DEFAULT network_api_class nova.network.api.API
-crudini --set /etc/nova/nova.conf DEFAULT security_group_api nova
-
-systemctl restart openstack-nova-api.service  openstack-nova-scheduler.service openstack-nova-conductor.service
-
-# Compute - Networking services
-
-yum install -y openstack-nova-network
-
-crudini --set /etc/nova/nova.conf DEFAULT network_api_class nova.network.api.API
-crudini --set /etc/nova/nova.conf DEFAULT security_group_api nova
-crudini --set /etc/nova/nova.conf DEFAULT firewall_driver nova.virt.libvirt.firewall.IptablesFirewallDriver
-crudini --set /etc/nova/nova.conf DEFAULT network_manager nova.network.manager.FlatDHCPManager
-crudini --set /etc/nova/nova.conf DEFAULT network_size 254 
-crudini --set /etc/nova/nova.conf DEFAULT allow_same_net_traffic False
-crudini --set /etc/nova/nova.conf DEFAULT multi_host True
-crudini --set /etc/nova/nova.conf DEFAULT send_arp_for_ha True
-crudini --set /etc/nova/nova.conf DEFAULT share_dhcp_address True
-crudini --set /etc/nova/nova.conf DEFAULT force_dhcp_release True
-crudini --set /etc/nova/nova.conf DEFAULT flat_network_bridge br100
-crudini --set /etc/nova/nova.conf DEFAULT flat_interface eth0
-crudini --set /etc/nova/nova.conf DEFAULT public_interface eth0
-
-systemctl enable openstack-nova-network.service
-systemctl start openstack-nova-network.service
-
-nova network-create demo-net --bridge br100 --fixed-range-v4 203.0.113.24/29
-
-# OpenStack Dashboard
-
-# 1. Install OpenStack Compute Service and dependencies
-yum install -y openstack-dashboard httpd mod_wsgi memcached python-memcached
-
-# 2. Configure settings
-sed -i "s/OPENSTACK_HOST = \"127.0.0.1\"/OPENSTACK_HOST = \"all-in-one\"/g" /etc/openstack-dashboard/local_settings
-
-# 3. Configure memcached
-sed -i "s/'django.core.cache.backends.locmem.LocMemCache'/'django.core.cache.backends.memcached.MemcachedCache',\n        'LOCATION': '127.0.0.1:11211'/g" /etc/openstack-dashboard/local_settings
-
-# 4. Configure SELinux to permit the web server to connect
-setsebool -P httpd_can_network_connect on
-
-# Block storage service
-
-# 4. Configure SELinux to permit the web server to connect
-setsebool -P httpd_can_network_connect on
-
-# 5. Solve the CSS issue
-chown -R apache:apache /usr/share/openstack-dashboard/static
-
-# 6. Enable services
-systemctl enable httpd.service memcached.service
-systemctl start httpd.service memcached.service
-
-# 1. Install OpenStack Block Storage Service and dependencies
-yum install -y openstack-cinder python-cinderclient python-oslo-db
-
-# 1.1 Workaround for cinder-api dependency
-yum install -y python-keystonemiddleware
-
-# 2. Configure Database driver
-crudini --set /etc/cinder/cinder.conf database connection  mysql://cinder:secure@all-in-one/cinder
-
-# 3. Configure message broker service
-crudini --set /etc/cinder/cinder.conf DEFAULT rpc_backend rabbit
-crudini --set /etc/cinder/cinder.conf DEFAULT rabbit_host all-in-one
-crudini --set /etc/cinder/cinder.conf DEFAULT rabbit_password secure
-
-# 4. Configure Identity Service
-crudini --set /etc/cinder/cinder.conf DEFAULT auth_strategy keystone
-crudini --set /etc/cinder/cinder.conf keystone_authtoken auth_uri http://all-in-one:5000/v2.0
-crudini --set /etc/cinder/cinder.conf keystone_authtoken identity_uri http://all-in-one:35357
-crudini --set /etc/cinder/cinder.conf keystone_authtoken admin_tenant_name service
-crudini --set /etc/cinder/cinder.conf keystone_authtoken admin_user cinder
-crudini --set /etc/cinder/cinder.conf keystone_authtoken admin_password secure
-
-crudini --set /etc/cinder/cinder.conf DEFAULT my_ip ${my_ip}
-
-# 5. Generate tables
-su -s /bin/sh -c "cinder-manage db sync" cinder
-
-# 6. Enable and start services
-systemctl enable openstack-cinder-api.service openstack-cinder-scheduler.service
-systemctl start openstack-cinder-api.service openstack-cinder-scheduler.service
-
-# Telemetry service
-
-# 1. Install OpenStack Telemetry Service and dependencies
-yum install -y openstack-ceilometer-api openstack-ceilometer-collector openstack-ceilometer-notification openstack-ceilometer-central openstack-ceilometer-alarm python-ceilometerclient
-
-# 2. Configure database connection
-crudini --set /etc/ceilometer/ceilometer.conf database connection mongodb://ceilometer:secure@all-in-one:27017/ceilometer
-
-# 3. Configure message broker connection
-crudini --set /etc/ceilometer/ceilometer.conf DEFAULT rabbit_host all-in-one
-crudini --set /etc/ceilometer/ceilometer.conf rabbit_password secure
-crudini --set /etc/ceilometer/ceilometer.conf auth_strategy keystone
-
-# 4. Configure authentication
-crudini --set /etc/ceilometer/ceilometer.conf DEFAULT auth_strategy keystone
-crudini --set /etc/ceilometer/ceilometer.conf keystone_authtoken auth_uri http://all-in-one:5000/v2.0
-crudini --set /etc/ceilometer/ceilometer.conf keystone_authtoken identity_uri http://all-in-one:35357
-crudini --set /etc/ceilometer/ceilometer.conf keystone_authtoken admin_tenant_name service
-crudini --set /etc/ceilometer/ceilometer.conf keystone_authtoken admin_user ceilometer
-crudini --set /etc/ceilometer/ceilometer.conf keystone_authtoken admin_password secure
-
-# 5 Configure service credentials
-crudini --set /etc/ceilometer/ceilometer.conf service_credentials os_auth_url http://all-in-one:35357
-crudini --set /etc/ceilometer/ceilometer.conf service_credentials os_username ceilometer
-crudini --set /etc/ceilometer/ceilometer.conf service_credentials os_tenant_name service
-crudini --set /etc/ceilometer/ceilometer.conf service_credentials os_password secure
-
-token=`openssl rand -hex 10`
-crudini --set /etc/ceilometer/ceilometer.conf publisher metering_secret ${token}
-
-systemctl enable openstack-ceilometer-api.service openstack-ceilometer-notification.service  openstack-ceilometer-central.service openstack-ceilometer-collector.service openstack-ceilometer-alarm-evaluator.service openstack-ceilometer-alarm-notifier.service
-systemctl start openstack-ceilometer-api.service openstack-ceilometer-notification.service openstack-ceilometer-central.service openstack-ceilometer-collector.service openstack-ceilometer-alarm-evaluator.service openstack-ceilometer-alarm-notifier.service
-
-# Compute Service
-
-# 1. Install OpenStack Compute Service and dependencies
-yum install -y openstack-nova-compute sysfsutils
-
-# 2. Configure message broker service
-crudini --set /etc/nova/nova.conf DEFAULT rpc_backend rabbit
-crudini --set /etc/nova/nova.conf oslo_messaging_rabbit rabbit_host all-in-one
-crudini --set /etc/nova/nova.conf oslo_messaging_rabbit rabbit_userid openstack
-crudini --set /etc/nova/nova.conf oslo_messaging_rabbit rabbit_password secure
-
-# 4. Configure Identity Service
-crudini --set /etc/nova/nova.conf DEFAULT auth_strategy keystone
-crudini --set /etc/nova/nova.conf keystone_authtoken auth_uri http://all-in-one:5000
-crudini --set /etc/nova/nova.conf keystone_authtoken auth_url http://all-in-one:35357
-crudini --set /etc/nova/nova.conf keystone_authtoken auth_plugin password
-crudini --set /etc/nova/nova.conf keystone_authtoken project_domain_id default
-crudini --set /etc/nova/nova.conf keystone_authtoken user_domain_id default 
-crudini --set /etc/nova/nova.conf keystone_authtoken project_name service
-crudini --set /etc/nova/nova.conf keystone_authtoken username nova
-crudini --set /etc/nova/nova.conf keystone_authtoken password secure
-
-crudini --set /etc/nova/nova.conf DEFAULT my_ip ${my_ip}
-
-# 3. Configure VNC Server
-crudini --set /etc/nova/nova.conf DEFAULT vnc_enabled True
-crudini --set /etc/nova/nova.conf DEFAULT vncserver_listen 0.0.0.0
-crudini --set /etc/nova/nova.conf DEFAULT vncserver_proxyclient_address 127.0.0.1
-crudini --set /etc/nova/nova.conf DEFAULT novncproxy_base_url http://all-in-one:6080/vnc_auto.html
-
-# 5. Configure Image Service
-crudini --set /etc/nova/nova.conf glance host all-in-one
-
-crudini --set /etc/nova/nova.conf oslo_concurrency lock_path /var/lib/nova/tmp
-
-# 6. Use KVM or QEMU
-supports_hardware_acceleration=`egrep -c '(vmx|svm)' /proc/cpuinfo`
-if [ $supports_hardware_acceleration -eq 0 ]; then
-  crudini --set /etc/nova/nova.conf libvirt virt_type qemu
-fi
-
-# 7. Restart services
-systemctl enable libvirtd.service openstack-nova-compute.service
-systemctl start libvirtd.service
-systemctl start openstack-nova-compute.service
-
-# Logical Volume
-
-# 1. Install Logical Volume Manager
-yum install -y lvm2
-
-# 1.1 Enable the LVM services
-systemctl enable lvm2-lvmetad.service
-systemctl start lvm2-lvmetad.service
-
-# 2. Create a partition based on other partition
-cat <<EOL > sdb.layout
-# partition table of /dev/sdb
-unit: sectors
-
-/dev/sdb1 : start=     2048, size= 83884032, Id=83, bootable
-/dev/sdb2 : start=        0, size=        0, Id= 0
-/dev/sdb3 : start=        0, size=        0, Id= 0
-/dev/sdb4 : start=        0, size=        0, Id= 0
-EOL
-sfdisk /dev/sdb < sdb.layout
-
-# 3. Create the LVM physical volume /dev/sdb1
-pvcreate /dev/sdb1
-
-# 4. Create the LVM volume group cinder-volumes
-vgcreate cinder-volumes /dev/sdb1
-
-# 5. Add a filter that accepts the /dev/sdb device and rejects all other devices
-sed -i "s/filter = \[ \"a\/.*\/\"/filter = \[ \"a\/sdb\/\", \"r\/.\*\/\"/g" /etc/lvm/lvm.conf
-
-# 1. Install OpenStack Compute Service and dependencies
-yum install -y openstack-cinder targetcli python-oslo-db MySQL-python
-
-# 2. Configure Database driver
-crudini --set /etc/cinder/cinder.conf database connection  mysql://cinder:secure@all-in-one/cinder
-
-# 3. Configure message broker service
-crudini --set /etc/cinder/cinder.conf DEFAULT rpc_backend rabbit
-crudini --set /etc/cinder/cinder.conf DEFAULT rabbit_host all-in-one
-crudini --set /etc/cinder/cinder.conf DEFAULT rabbit_password secure
-
-# 4. Configure Identity Service
-crudini --set /etc/cinder/cinder.conf DEFAULT auth_strategy keystone
-crudini --set /etc/cinder/cinder.conf keystone_authtoken auth_uri http://all-in-one:5000/v2.0
-crudini --set /etc/cinder/cinder.conf keystone_authtoken identity_uri http://all-in-one:35357
-crudini --set /etc/cinder/cinder.conf keystone_authtoken admin_tenant_name service
-crudini --set /etc/cinder/cinder.conf keystone_authtoken admin_user cinder
-crudini --set /etc/cinder/cinder.conf keystone_authtoken admin_password secure
-
-crudini --set /etc/cinder/cinder.conf DEFAULT my_ip ${my_ip}
-crudini --set /etc/cinder/cinder.conf DEFAULT glance_host all-in-one
-#crudini --set /etc/cinder/cinder.conf DEFAULT iscsi_helper lioadm
-crudini --set /etc/cinder/cinder.conf DEFAULT iscsi_helper tgtadm
-
-# 5. Start services
-systemctl enable openstack-cinder-volume.service target.service
-systemctl start openstack-cinder-volume.service target.service
